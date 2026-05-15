@@ -1391,6 +1391,11 @@ impl Parser {
                     }
                     PAX_SIZE => {
                         if let Some(v) = parse_pax_u64(&ext, PAX_SIZE)? {
+                            // Guard against values that would cause padded_size() to
+                            // wrap around: next_multiple_of(512) on a value near
+                            // u64::MAX overflows to 0, causing stream desynchronization.
+                            v.checked_next_multiple_of(HEADER_SIZE as u64)
+                                .ok_or(ParseError::InvalidSize(v))?;
                             entry_size = v;
                         }
                     }
@@ -3123,6 +3128,22 @@ mod tests {
             }
             other => panic!("Expected Entry, got {other:?}"),
         }
+    }
+
+    /// A PAX 'size' field of u64::MAX is valid as a u64, but
+    /// next_multiple_of(512) would overflow, causing stream
+    /// desynchronization. The parser must reject it with InvalidSize.
+    #[test]
+    fn test_pax_size_overflow_rejected() {
+        // u64::MAX = 18446744073709551615; next_multiple_of(512) wraps to 0
+        let size_str = format!("{}", u64::MAX);
+        let archive = make_archive_with_pax("size", size_str.as_bytes());
+        let mut parser = Parser::new(Limits::default());
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidSize(v) if v == u64::MAX),
+            "expected InvalidSize(u64::MAX), got {err:?}"
+        );
     }
 
     // =========================================================================
