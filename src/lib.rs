@@ -1536,10 +1536,17 @@ pub(crate) fn encode_numeric<const N: usize>(field: &mut [u8; N], value: u64) ->
     };
 
     if use_binary {
-        // GNU base-256 encoding: high bit of first byte is the indicator,
-        // leaving N*8-1 data bits. For 8-byte fields that's 63 bits, for
-        // 12-byte fields it's 95 bits (more than u64 needs).
-        let data_bits = N * 8 - 1;
+        // GNU base-256 encoding: bit 7 of the first byte is the base-256
+        // marker, and bit 6 is reserved as the sign bit (0 = positive). This
+        // leaves N*8-2 data bits for positive values. For 8-byte fields that's
+        // 62 bits (max 2^62-1); for 12-byte fields it's 94 bits (well above
+        // u64::MAX, so no overflow check needed).
+        //
+        // The sign-bit reservation is necessary so that the decoder can
+        // distinguish positive values (byte[0] & 0x40 == 0) from GNU tar's
+        // negative two's-complement values (byte[0] & 0x40 != 0, e.g. 0xff…
+        // for pre-epoch timestamps).
+        let data_bits = N * 8 - 2;
         if data_bits < 64 && value >= (1u64 << data_bits) {
             return Err(HeaderError::FieldOverflow {
                 field_len: N,
@@ -1618,13 +1625,31 @@ pub(crate) fn parse_numeric(bytes: &[u8]) -> Result<u64> {
 
     // Check for GNU base-256 encoding (high bit set)
     if bytes[0] & 0x80 != 0 {
-        // Base-256: interpret remaining bytes as big-endian, masking off the
-        // high bit of the first byte
+        // Reject negative base-256 values. GNU tar uses 0xff as the leading
+        // byte for two's complement negatives (e.g. pre-epoch timestamps).
+        // Bit 6 of the first byte is the sign bit in the 7 remaining payload
+        // bits; if set, the value is negative and we reject it.
+        //
+        // This explicit check is necessary because the overflow-based detection
+        // below only catches values that exceed 64 bits. For short fields (e.g.
+        // 8-byte uid/gid/devmajor/devminor), a 0xff-prefixed negative value has
+        // only 63 payload bits after masking byte[0] to 0x7f, which fits in u64
+        // without overflow and would otherwise be silently accepted.
+        if bytes[0] & 0x40 != 0 {
+            return Err(HeaderError::InvalidOctal(bytes.to_vec()));
+        }
+
+        // Positive base-256: decode the field as big-endian, masking off the
+        // high bit of the first byte. Values too large for u64 are rejected.
+        //
+        // Note: we use checked_mul(256) rather than checked_shl(8) because
+        // checked_shl only guards against an out-of-range shift count, not
+        // against the result overflowing u64.
         let mut value: u64 = 0;
         for (i, &byte) in bytes.iter().enumerate() {
             let b = if i == 0 { byte & 0x7f } else { byte };
             value = value
-                .checked_shl(8)
+                .checked_mul(256)
                 .and_then(|v| v.checked_add(u64::from(b)))
                 .ok_or_else(|| HeaderError::InvalidOctal(bytes.to_vec()))?;
         }
@@ -2196,6 +2221,115 @@ mod tests {
         let header = Header::from_bytes(&data);
         assert!(header.is_gnu());
         assert!(!header.is_ustar());
+    }
+
+    #[test]
+    fn test_base256_negative_is_rejected() {
+        // GNU tar uses 0xff as the leading byte for negative base-256 values
+        // (two's complement), primarily for pre-epoch timestamps. These should
+        // be rejected rather than silently decoded as huge positive values.
+
+        // 0xff followed by zeros: represents -1 in two's complement base-256,
+        // which would otherwise decode as a garbage huge positive u64.
+        let neg_one: &[u8] = &[
+            0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(
+            parse_numeric(neg_one).is_err(),
+            "0xff... (negative base-256) must be rejected, not decoded as a huge positive u64"
+        );
+
+        // 0xff followed by other bytes (e.g., a pre-epoch timestamp like -86400)
+        let pre_epoch: &[u8] = &[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xa0,
+        ];
+        assert!(
+            parse_numeric(pre_epoch).is_err(),
+            "0xff... pre-epoch timestamp must be rejected, not decoded as garbage"
+        );
+
+        // Ensure it's specifically an InvalidOctal error
+        match parse_numeric(neg_one) {
+            Err(HeaderError::InvalidOctal(_)) => {} // expected
+            other => panic!("expected InvalidOctal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_base256_positive_still_works() {
+        // 0x80 prefix (positive base-256) must continue to work correctly.
+        let cases: &[(&[u8], u64)] = &[
+            (&[0x80, 0x00, 0x00, 0x01], 1),
+            (&[0x80, 0x01, 0x00], 256),
+            // Large value that wouldn't fit in octal
+            (
+                &[
+                    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
+                1u64 << 40,
+            ),
+            // 0x80 followed by 0xff: the payload byte is 0xff = 255 (the 0x80
+            // marker byte contributes 0x00 to the value after masking)
+            (&[0x80, 0xff], 255),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_numeric(input).unwrap(),
+                *expected,
+                "positive base-256 parse_numeric({input:?}) should succeed"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Base-256 short-field (8-byte) sign-bit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_base256_negative_short_field_rejected() {
+        // [0xff; 8] represents -1 in GNU tar's 8-byte base-256 two's complement
+        // encoding. The 8-byte form has only 63 payload bits after masking, so
+        // the previous overflow-based detection silently accepted it as i64::MAX.
+        let neg_one: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        match parse_numeric(neg_one) {
+            Err(HeaderError::InvalidOctal(_)) => {} // expected
+            other => panic!("expected InvalidOctal for 8-byte 0xff…, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_base256_negative_short_field_large_value_rejected() {
+        // [0xff, 0x00, ..] is the "most negative" 8-byte base-256 value.
+        let most_negative: &[u8] = &[0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        match parse_numeric(most_negative) {
+            Err(HeaderError::InvalidOctal(_)) => {} // expected
+            other => panic!("expected InvalidOctal for [0xff, 0x00×7], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_base256_positive_short_field_still_works() {
+        // [0x80, 0x00, …, 0x01] has bit 7 set (base-256 marker) and bit 6 clear
+        // (positive), encoding the value 1.
+        let input: &[u8] = &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(
+            parse_numeric(input).unwrap(),
+            1,
+            "8-byte positive base-256 value 1 should parse correctly"
+        );
+    }
+
+    #[test]
+    fn test_base256_max_positive_short_field_works() {
+        // [0xbf, 0xff, …] has bit 7 set (base-256 marker) and bit 6 clear
+        // (positive, since 0xbf & 0x40 == 0). After masking byte[0] to 0x3f,
+        // the value is 0x3fff_ffff_ffff_ffff = 4_611_686_018_427_387_903.
+        let input: &[u8] = &[0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(
+            parse_numeric(input).unwrap(),
+            4_611_686_018_427_387_903,
+            "8-byte base-256 [0xbf, 0xff×7] should parse as 0x3fff_ffff_ffff_ffff"
+        );
     }
 
     // =========================================================================
@@ -3307,17 +3441,19 @@ mod tests {
                     prop_assert_eq!(parse_octal(&field).unwrap(), value);
                 }
 
-                // 8-byte base-256 has 63 data bits, so values < 2^63 roundtrip.
+                // 8-byte base-256 reserves bit 6 of byte[0] as the sign bit,
+                // leaving 62 data bits (max 2^62-1 = 4_611_686_018_427_387_903).
                 #[test]
-                fn test_encode_numeric_8_roundtrip(value in 0u64..=(i64::MAX as u64)) {
+                fn test_encode_numeric_8_roundtrip(value in 0u64..=(1u64 << 62) - 1) {
                     let mut field = [0u8; 8];
                     encode_numeric(&mut field, value).unwrap();
                     prop_assert_eq!(parse_numeric(&field).unwrap(), value);
                 }
 
-                // Values >= 2^63 cannot be represented in an 8-byte base-256 field.
+                // Values >= 2^62 cannot be represented in an 8-byte base-256 field
+                // without setting the sign bit, so encode_numeric must reject them.
                 #[test]
-                fn test_encode_numeric_8_rejects_huge(value in (i64::MAX as u64 + 1)..=u64::MAX) {
+                fn test_encode_numeric_8_rejects_huge(value in (1u64 << 62)..=u64::MAX) {
                     let mut field = [0u8; 8];
                     prop_assert!(encode_numeric(&mut field, value).is_err());
                 }
