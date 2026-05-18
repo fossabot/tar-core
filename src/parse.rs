@@ -291,6 +291,25 @@ pub enum ParseError {
         /// Position in the stream where EOF occurred.
         pos: u64,
     },
+
+    /// A single all-zero 512-byte block was encountered mid-stream.
+    ///
+    /// A valid end-of-archive requires two consecutive zero blocks (POSIX).
+    /// GNU tar and Go's archive/tar treat a lone zero block as an error or
+    /// end-of-archive, never silently skipping it. Skipping it would let
+    /// entries after the zero block be visible to tar-core but hidden from
+    /// other parsers — an archive confusion vector.
+    #[error("stray zero block in archive")]
+    StrayZeroBlock,
+
+    /// A header-only entry type (symlink, hardlink, directory, character/block
+    /// device, FIFO) had a non-zero size field. These entry types carry no data
+    /// content; their size must be zero. A non-zero size creates a parser
+    /// confusion vector: tar-core would report bytes to skip while parsers that
+    /// enforce size=0 (e.g. Go's archive/tar) would read those bytes as the
+    /// next header, hiding entries from a tar-core-based scanner.
+    #[error("non-zero size {0} for header-only entry type")]
+    NonZeroSizeForHeaderOnlyEntry(u64),
 }
 
 /// Result type for parsing operations.
@@ -840,11 +859,11 @@ impl Parser {
                     * HEADER_SIZE;
                 return Ok(ParseEvent::End { consumed });
             }
-            // Not end of archive — single stray zero block; skip it and
-            // continue with the next block as a header.
-            return self
-                .parse_header(&input[HEADER_SIZE..], slices)
-                .map(|e| e.add_consumed(HEADER_SIZE));
+            // Not end of archive — single stray zero block.  Silently
+            // skipping it would let entries after the zero block be visible
+            // to tar-core but hidden from Go's archive/tar (which errors)
+            // and GNU tar / Python (which stop).  Return an error instead.
+            return Err(ParseError::StrayZeroBlock);
         }
 
         // Check pending entry limit
@@ -1391,6 +1410,11 @@ impl Parser {
                     }
                     PAX_SIZE => {
                         if let Some(v) = parse_pax_u64(&ext, PAX_SIZE)? {
+                            // Guard against values that would cause padded_size() to
+                            // wrap around: next_multiple_of(512) on a value near
+                            // u64::MAX overflows to 0, causing stream desynchronization.
+                            v.checked_next_multiple_of(HEADER_SIZE as u64)
+                                .ok_or(ParseError::InvalidSize(v))?;
                             entry_size = v;
                         }
                     }
@@ -1547,6 +1571,16 @@ impl Parser {
 
         // Validate final path length
         self.limits.check_path_len(path.len())?;
+
+        // Header-only entry types (symlinks, hardlinks, directories,
+        // character/block devices, FIFOs) carry no data content — their size
+        // field must be zero. Enforce this AFTER PAX size overrides so an
+        // attacker cannot bypass the check by leaving size=0 in the header
+        // and injecting a non-zero value via a PAX "size" record.
+        let entry_type = header.entry_type();
+        if entry_type.is_header_only() && entry_size != 0 {
+            return Err(ParseError::NonZeroSizeForHeaderOnlyEntry(entry_size));
+        }
 
         let entry = ParsedEntry {
             header,
@@ -3125,6 +3159,22 @@ mod tests {
         }
     }
 
+    /// A PAX 'size' field of u64::MAX is valid as a u64, but
+    /// next_multiple_of(512) would overflow, causing stream
+    /// desynchronization. The parser must reject it with InvalidSize.
+    #[test]
+    fn test_pax_size_overflow_rejected() {
+        // u64::MAX = 18446744073709551615; next_multiple_of(512) wraps to 0
+        let size_str = format!("{}", u64::MAX);
+        let archive = make_archive_with_pax("size", size_str.as_bytes());
+        let mut parser = Parser::new(Limits::default());
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidSize(v) if v == u64::MAX),
+            "expected InvalidSize(u64::MAX), got {err:?}"
+        );
+    }
+
     // =========================================================================
     // Sparse entry helpers
     // =========================================================================
@@ -4269,5 +4319,174 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // =========================================================================
+    // Stray zero block tests
+    // =========================================================================
+
+    /// A single all-zero 512-byte block appearing mid-stream (between two valid
+    /// entries) must be rejected.  Go's archive/tar returns ErrHeader; GNU tar
+    /// and Python stop at the first zero block (treating it as end-of-archive).
+    /// Silently skipping it creates a confusion window where tar-core sees more
+    /// entries than other parsers do.
+    #[test]
+    fn test_stray_zero_block_is_error() {
+        let mut archive = Vec::new();
+
+        // First valid file entry (0 bytes of content)
+        archive.extend_from_slice(&make_header(b"first.txt", 0, b'0'));
+
+        // Single all-zero 512-byte block — stray, not a valid EOA pair
+        archive.extend(zeroes(512));
+
+        // Second valid file entry — would be hidden from Go/GNU/Python parsers
+        archive.extend_from_slice(&make_header(b"second.txt", 0, b'0'));
+
+        // Two zero blocks for proper EOA
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // Consume the first entry
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match event {
+            ParseEvent::Entry { consumed, entry } => {
+                assert_eq!(entry.path.as_ref(), b"first.txt");
+                consumed
+            }
+            other => panic!("Expected first Entry, got {:?}", other),
+        };
+
+        // The next parse call should encounter the stray zero block and error
+        let result = parser.parse(&archive[consumed..]);
+        assert!(
+            matches!(result, Err(ParseError::StrayZeroBlock)),
+            "Expected StrayZeroBlock error, got {:?}",
+            result
+        );
+    }
+
+    /// Two consecutive all-zero 512-byte blocks constitute a valid
+    /// end-of-archive marker and must still produce ParseEvent::End.
+    /// This is a regression guard for the normal EOA path.
+    #[test]
+    fn test_two_zero_blocks_is_valid_eoa() {
+        let mut archive = Vec::new();
+
+        // One valid file entry
+        archive.extend_from_slice(&make_header(b"file.txt", 0, b'0'));
+
+        // Two consecutive zero blocks = valid EOA
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // Consume the file entry
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match event {
+            ParseEvent::Entry { consumed, entry } => {
+                assert_eq!(entry.path.as_ref(), b"file.txt");
+                consumed
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        };
+
+        // The two zero blocks should produce End, not an error
+        let event = parser.parse(&archive[consumed..]).unwrap();
+        assert!(
+            matches!(event, ParseEvent::End { .. }),
+            "Expected End for two-zero-block EOA, got {:?}",
+            event
+        );
+    }
+
+    // =========================================================================
+    // Header-only entry type size validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_header_only_type_nonzero_size_rejected() {
+        // A symlink header (type '2') with a non-zero size field must be
+        // rejected: symlinks carry no data content.
+        let header = make_header(b"mylink", 512, b'2');
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        // 512 bytes of "content" (would be the next header in a real attack)
+        archive.extend(zeroes(512));
+        archive.extend(zeroes(1024)); // EOA
+
+        let mut parser = Parser::new(Limits::default());
+        let result = parser.parse(&archive);
+        assert!(
+            matches!(result, Err(ParseError::NonZeroSizeForHeaderOnlyEntry(512))),
+            "Expected NonZeroSizeForHeaderOnlyEntry(512), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_header_only_type_zero_size_ok() {
+        // A symlink header with size=0 must be accepted (regression guard).
+        let mut header = make_header(b"mylink", 0, b'2');
+        // Set a link target
+        header[157..164].copy_from_slice(b"target/");
+        // Recompute checksum
+        let hdr = Header::from_bytes(&header);
+        let checksum = hdr.compute_checksum();
+        let checksum_str = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum_str.as_bytes());
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(1024)); // EOA
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert!(entry.is_symlink(), "Expected symlink entry");
+                assert_eq!(entry.size, 0, "Symlink size must be 0");
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hardlink_nonzero_size_rejected() {
+        // A hardlink header (type '1') with a non-zero size field must be
+        // rejected.
+        let header = make_header(b"hardlink", 512, b'1');
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(512));
+        archive.extend(zeroes(1024)); // EOA
+
+        let mut parser = Parser::new(Limits::default());
+        let result = parser.parse(&archive);
+        assert!(
+            matches!(result, Err(ParseError::NonZeroSizeForHeaderOnlyEntry(512))),
+            "Expected NonZeroSizeForHeaderOnlyEntry(512), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_directory_nonzero_size_rejected() {
+        // A directory header (type '5') with a non-zero size field must be
+        // rejected.
+        let header = make_header(b"mydir/", 512, b'5');
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(512));
+        archive.extend(zeroes(1024)); // EOA
+
+        let mut parser = Parser::new(Limits::default());
+        let result = parser.parse(&archive);
+        assert!(
+            matches!(result, Err(ParseError::NonZeroSizeForHeaderOnlyEntry(512))),
+            "Expected NonZeroSizeForHeaderOnlyEntry(512), got {:?}",
+            result
+        );
     }
 }

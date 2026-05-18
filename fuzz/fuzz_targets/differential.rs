@@ -16,11 +16,26 @@
 //! - **Malformed PAX records**: tar-core propagates PAX parse errors
 //!   (malformed record format, non-UTF-8 keys). tar-rs silently skips
 //!   malformed PAX records via `.flatten()`.
+//!
+//! - **Invalid/reserved base-256 numeric fields**: tar-core correctly rejects
+//!   numeric fields (e.g. size, mtime) whose leading byte is neither valid
+//!   octal ASCII nor a spec-defined base-256 marker (0x80 positive, 0xff
+//!   negative). The original tar-rs used `checked_shl(8)` which never
+//!   detected overflow, silently wrapping reserved leading bytes (e.g. 0x8e)
+//!   to garbage u64 values and continuing to parse. tar-core correctly
+//!   returns InvalidOctal for these malformed fields.
+//!
+//! - **Non-zero size on header-only entry types**: tar-core rejects entries
+//!   whose type byte indicates they carry no content (FIFOs, directories,
+//!   character/block devices, symbolic links, hard links) but whose `size`
+//!   field is non-zero. tar-rs silently accepts such archives and treats the
+//!   non-zero size as content bytes, which can lead to stream desynchronisation.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use tar_core::parse::{Limits, ParseError};
+use tar_core::{HeaderError};
 use tar_core_testutil::{parse_tar_core_detailed, parse_tar_rs, OwnedEntry};
 
 /// Dump the raw 512-byte headers from the (post-fixup) data to stderr.
@@ -52,6 +67,14 @@ fn is_allowlisted_divergence(err: &ParseError) -> bool {
         err,
         // tar-core rejects malformed PAX records; tar-rs silently skips them.
         ParseError::Pax(_) | ParseError::InvalidUtf8(_)
+        // tar-core correctly rejects numeric fields with reserved or overflowing
+        // base-256 leading bytes. tar-rs used checked_shl(8) which never
+        // detected overflow, silently wrapping these to garbage u64 values.
+        | ParseError::Header(HeaderError::InvalidOctal(_))
+        // tar-core rejects non-zero size fields on header-only entry types
+        // (FIFOs, directories, device nodes, symlinks). tar-rs accepts them
+        // and treats the bytes as file content, risking stream desync.
+        | ParseError::NonZeroSizeForHeaderOnlyEntry(_)
     )
 }
 
