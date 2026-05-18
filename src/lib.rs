@@ -1116,39 +1116,59 @@ impl Header {
 
     /// Verify the header checksum.
     ///
-    /// The checksum is computed as the unsigned sum of all header bytes,
-    /// treating the checksum field (bytes 148..156) as spaces.
+    /// Accepts both the unsigned (POSIX) and signed (historical BSD tar) byte
+    /// sums. GNU tar, Go, and Python all accept either; see
+    /// [`compute_checksum_signed`](Self::compute_checksum_signed) for details.
     ///
     /// # Errors
     ///
-    /// Returns [`HeaderError::ChecksumMismatch`] if the checksum is invalid,
+    /// Returns [`HeaderError::ChecksumMismatch`] if neither checksum matches,
     /// or [`HeaderError::InvalidOctal`] if the stored checksum cannot be parsed.
     pub fn verify_checksum(&self) -> Result<()> {
         let expected = parse_octal(&self.as_ustar().cksum)?;
-        let computed = self.compute_checksum();
-        if expected == computed {
+        let unsigned = self.compute_checksum();
+        if expected == unsigned {
+            return Ok(());
+        }
+        // Fall back to the signed interpretation; see compute_checksum_signed.
+        let signed = self.compute_checksum_signed();
+        if expected == signed {
             Ok(())
         } else {
-            Err(HeaderError::ChecksumMismatch { expected, computed })
+            Err(HeaderError::ChecksumMismatch {
+                expected,
+                computed: unsigned,
+            })
         }
     }
 
-    /// Compute the header checksum.
-    ///
-    /// This computes the unsigned sum of all header bytes, treating the
-    /// checksum field (bytes 148..156) as spaces (0x20).
+    /// Compute the header checksum using unsigned byte arithmetic (POSIX).
     #[must_use]
     pub fn compute_checksum(&self) -> u64 {
         let mut sum: u64 = 0;
         for (i, &byte) in self.bytes.iter().enumerate() {
             if (148..156).contains(&i) {
-                // Treat checksum field as spaces
                 sum += u64::from(b' ');
             } else {
                 sum += u64::from(byte);
             }
         }
         sum
+    }
+
+    /// Compute the header checksum using signed byte arithmetic (historical BSD tar).
+    #[must_use]
+    pub fn compute_checksum_signed(&self) -> u64 {
+        let mut sum: i64 = 0;
+        for (i, &byte) in self.bytes.iter().enumerate() {
+            let val = if (148..156).contains(&i) {
+                i64::from(b' ')
+            } else {
+                i64::from(byte as i8)
+            };
+            sum = sum.wrapping_add(val);
+        }
+        sum as u64
     }
 
     /// Check if this header represents an empty block (all zeros).
@@ -2029,6 +2049,38 @@ mod tests {
             assert_eq!(ty.is_symlink(), sym, "{ty:?}.is_symlink()");
             assert_eq!(ty.is_hard_link(), hard, "{ty:?}.is_hard_link()");
         }
+    }
+
+    #[test]
+    fn test_verify_checksum_accepts_signed_bsd_checksum() {
+        // Verify the signed-checksum fallback path in verify_checksum().
+        // Build a GNU header with a 10 GiB size so set_size() is forced to
+        // use base-256 encoding, introducing a 0x80 byte that makes the
+        // signed and unsigned sums diverge.
+        let mut header = Header::new_gnu();
+        header.set_path(b"test.txt").unwrap();
+        header.set_mode_small(0o644);
+        header.set_mtime_small(1_471_234_567);
+        header.set_entry_type(EntryType::Regular);
+        // 10 GiB — above the ~8.5 GiB octal ceiling, forcing base-256.
+        header.set_size(10 * 1024 * 1024 * 1024).unwrap();
+
+        // Now write the *signed* checksum (instead of the unsigned one that
+        // set_checksum() would write). This is what historical BSD tar produced.
+        let signed_sum = header.compute_checksum_signed();
+        let unsigned_sum = header.compute_checksum();
+        assert_ne!(
+            unsigned_sum, signed_sum,
+            "test requires unsigned != signed; the base-256 0x80 byte should cause divergence"
+        );
+        let checksum_str = format!("{signed_sum:06o}\0 ");
+        header.as_mut_bytes()[148..156].copy_from_slice(checksum_str.as_bytes());
+
+        // verify_checksum() must accept the signed checksum via the fallback path.
+        assert!(
+            header.verify_checksum().is_ok(),
+            "verify_checksum should accept signed BSD-style checksum"
+        );
     }
 
     #[test]
