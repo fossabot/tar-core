@@ -171,6 +171,20 @@ pub fn parse_tar_core_detailed(data: &[u8], limits: Limits) -> TarCoreParseResul
     }
 }
 
+/// Truncate a byte slice at the first NUL byte, if any.
+///
+/// GNU LongName/LongLink content is NUL-terminated (C-string convention).
+/// tar-core truncates at the first NUL when resolving these extension headers,
+/// matching GNU tar and POSIX filesystem semantics (NUL is not a valid filename
+/// character). tar-rs does not perform this truncation, so we normalize its
+/// output here before comparison.
+fn truncate_at_nul(bytes: Vec<u8>) -> Vec<u8> {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(pos) => bytes[..pos].to_vec(),
+        None => bytes,
+    }
+}
+
 /// Parse a tar archive with the `tar` crate, returning owned entries.
 pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
     let mut results = Vec::new();
@@ -190,7 +204,11 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
         let header = entry.header().clone();
         let entry_type = header.entry_type().as_byte();
 
-        let path = entry.path_bytes().into_owned();
+        // Normalize NUL-termination: tar-rs does not truncate GNU LongName/
+        // LongLink content at the first NUL byte; tar-core does (matching the
+        // C-string convention used by GNU tar). Truncate here so we compare
+        // equivalent representations.
+        let path = truncate_at_nul(entry.path_bytes().into_owned());
         let size = entry.size();
 
         // Require that numeric fields parse successfully.  tar-core
@@ -229,10 +247,12 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
         }
         // entry.link_name_bytes() applies PAX linkpath and GNU long link
         // overrides, unlike header.link_name_bytes() which is raw.
+        // Also truncate at the first NUL to match tar-core's behavior for
+        // GNU LongLink content (same NUL-termination normalization as path).
         let link_target = entry
             .link_name_bytes()
             .filter(|b| !b.is_empty())
-            .map(|b| b.to_vec());
+            .map(|b| truncate_at_nul(b.to_vec()));
 
         // Extract PAX-overridden uname/gname and xattrs from PAX extensions.
         // tar-rs does not expose PAX uname/gname through entry-level methods,
