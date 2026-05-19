@@ -30,6 +30,12 @@
 //!   character/block devices, symbolic links, hard links) but whose `size`
 //!   field is non-zero. tar-rs silently accepts such archives and treats the
 //!   non-zero size as content bytes, which can lead to stream desynchronisation.
+//!
+//! - **GNU LongName/LongLink NUL truncation**: tar-core truncates the resolved
+//!   path/link-target at the first NUL byte, matching GNU tar's C-string
+//!   convention. tar-rs returns the full content without truncation. This is
+//!   normalized in `parse_tar_rs` (in testutil) before comparison, not treated
+//!   as a hard error.
 
 #![no_main]
 
@@ -58,7 +64,8 @@ fn dump_headers(data: &[u8]) {
 }
 
 /// Returns true if the error is a known behavioral difference where
-/// tar-core is intentionally stricter than tar-rs.
+/// tar-core is intentionally stricter than tar-rs in ways that produce
+/// hard errors (not just output normalization).
 ///
 /// When this returns true, tar-rs may have parsed more entries than
 /// tar-core, and that's expected.
@@ -84,6 +91,11 @@ fn is_allowlisted_divergence(err: &ParseError) -> bool {
 /// all-null numeric fields are accepted as 0), so we only require that
 /// tar-core parses *at least* as many entries as tar-rs and that those
 /// entries match.
+///
+/// Note: paths and link_targets from tar-rs are pre-normalized by
+/// `truncate_at_nul` in `parse_tar_rs` to account for tar-core correctly
+/// truncating GNU LongName/LongLink content at the first NUL byte (matching
+/// GNU tar's C-string convention) while tar-rs does not.
 fn compare_entries(
     data: &[u8],
     tar_rs_entries: &[OwnedEntry],
