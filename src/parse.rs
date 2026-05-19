@@ -1006,14 +1006,20 @@ impl Parser {
         let content_end = content_start + size as usize;
         let mut data: &'a [u8] = &input[content_start..content_end];
 
-        // Strip trailing null for GNU long name/link
+        // Truncate GNU long name/link content at the first NUL byte.
+        //
+        // The GNU tar format specifies that LongName/LongLink content is a
+        // NUL-terminated C string.  Stopping at the first NUL (not just
+        // stripping a trailing one) is correct: content that is padded with
+        // zeros to fill a block boundary, or that has an embedded NUL due to
+        // archive corruption or overlay, should not contribute bytes to the
+        // path beyond the terminator.  This matches what GNU tar, Python
+        // tarfile, and Go archive/tar all do.
         if matches!(
             kind,
             ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink
         ) {
-            if let Some(trimmed) = data.strip_suffix(&[0]) {
-                data = trimmed;
-            }
+            data = crate::truncate_null(data);
             self.limits.check_path_len(data.len())?;
         }
 
@@ -1958,6 +1964,73 @@ mod tests {
     // =========================================================================
     // GNU long name tests
     // =========================================================================
+
+    /// Build a GNU `L` header whose content is `raw_content` verbatim
+    /// (no trailing NUL added).  Used for testing embedded-NUL truncation.
+    fn make_gnu_long_name_raw(raw_content: &[u8]) -> Vec<u8> {
+        let padded = raw_content.len().next_multiple_of(HEADER_SIZE);
+        let header = make_header(b"././@LongLink", raw_content.len() as u64, b'L');
+        let mut result = Vec::with_capacity(HEADER_SIZE + padded);
+        result.extend_from_slice(&header);
+        result.extend_from_slice(raw_content);
+        result.extend(zeroes(padded - raw_content.len()));
+        result
+    }
+
+    /// GNU LongName content is NUL-terminated: an embedded NUL must truncate
+    /// the path just like a trailing NUL does.  This matches GNU tar, Python
+    /// tarfile, and Go archive/tar.
+    #[test]
+    fn test_parser_gnu_long_name_embedded_nul_truncates() {
+        // Content: "safe\x00evil" — the first NUL terminates at "safe".
+        let raw: &[u8] = b"safe\x00evil";
+
+        let mut archive = Vec::new();
+        archive.extend(make_gnu_long_name_raw(raw));
+        archive.extend_from_slice(&make_header(b"placeholder", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        match parser.parse(&archive).unwrap() {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(
+                    entry.path.as_ref(),
+                    b"safe",
+                    "embedded NUL should truncate LongName path"
+                );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    /// A GNU LongName padded with NUL bytes to 100 bytes, followed by mode-like
+    /// ASCII bytes within the declared size — the pattern produced by the overlay
+    /// mutation strategy.  Only the bytes before the first NUL should be used.
+    #[test]
+    fn test_parser_gnu_long_name_nul_padded_header_bytes() {
+        // "safe" + 96 NUL bytes (fills a ustar name field) + "0000644\x00"
+        let mut raw: Vec<u8> = b"safe".to_vec();
+        raw.resize(100, 0u8);
+        raw.extend_from_slice(b"0000644\x00");
+        assert_eq!(raw.len(), 108);
+
+        let mut archive = Vec::new();
+        archive.extend(make_gnu_long_name_raw(&raw));
+        archive.extend_from_slice(&make_header(b"placeholder", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        match parser.parse(&archive).unwrap() {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(
+                    entry.path.as_ref(),
+                    b"safe",
+                    "NUL padding after short name must truncate, not include mode-field bytes"
+                );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_parser_gnu_long_name() {
