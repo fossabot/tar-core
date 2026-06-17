@@ -1,4 +1,6 @@
 # tar-core
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fcomposefs%2Ftar-core.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fcomposefs%2Ftar-core?ref=badge_shield)
+
 
 Sans-IO tar header parsing and building for sync and async runtimes.
 
@@ -25,3 +27,6 @@ Licensed under either of:
   <http://opensource.org/licenses/MIT>)
 
 at your option.
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fcomposefs%2Ftar-core.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fcomposefs%2Ftar-core?ref=badge_large)
